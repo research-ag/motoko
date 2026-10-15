@@ -4,7 +4,7 @@ import Prim "mo:⛔";
 // decoding error of the reply) runs the `finally` blocks of the awaiting
 // code regardless of whether that await was already waiting when the
 // response arrived or only awaits the future later.
-persistent actor Self {
+actor Self {
 
   type T = { x : Nat };
   type T2 = { x2 : Nat };
