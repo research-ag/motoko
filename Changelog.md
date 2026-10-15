@@ -10,6 +10,13 @@
     even after a top-up. A one-shot timer whose job was rejected that way is
     now retried instead of dropped (#6440).
 
+  * bugfix: a trap while receiving a call's response (e.g. a Candid decoding
+    error of the reply) now runs the awaiting code's `finally` blocks even
+    when the response arrives before the future is awaited. Previously, the
+    `finally` blocks were skipped and the later `await` (or `await?`) never
+    resumed; it now traps as if the response had arrived during the
+    `await` (#NNNN).
+
 ## 2.0.0 (2026-10-06)
 
 * Upgrading from `moc` 1.x? The [moc v1 → v2 migration guide](doc/md/moc-v2-migration.md)

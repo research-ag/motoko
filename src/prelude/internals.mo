@@ -268,6 +268,7 @@ type @Cont<T> = T -> ();
 type @Async<T> = (@Cont<T>, @Cont<Error>, @BailCont) -> {
   #suspend;
   #schedule : () -> ();
+  #trap : () -> ();
 };
 
 type @Refund = Nat;
@@ -327,10 +328,36 @@ func @new_async<T <: Any>() : (@Async<T>, @Cont<T>, @Cont<Error>, @CleanCont) {
 
   var cleanup : @BailCont = @cleanup;
 
+  // Set when the reply/reject callback trapped (e.g. on a Candid decoding
+  // error), in which case the IC invokes the cleanup callback instead.
+  // The trap rolled back any `fulfill`/`fail`, so `result` stays `null`.
+  // Awaits registered after this point must trap as well.
+  var trapped = false;
+
+  func clean() {
+    trapped := true;
+    ws := w_null;
+    rs := r_null;
+    let cleanup_ = cleanup;
+    cleanup := @cleanup;
+    cleanup_();
+  };
+
   func enqueue(k : @Cont<T>, r : @Cont<Error>, b : @BailCont) : {
     #suspend;
     #schedule : () -> ();
+    #trap : () -> ();
   } {
+    if trapped {
+      // Trap in a fresh callback so that `b` (the awaiter's pending
+      // `finally` blocks) runs as its cleanup, exactly as if the
+      // response had arrived while this await was waiting.
+      return #trap(
+        func() {
+          (prim "trap" : Text -> None)("awaited call's response callback trapped (e.g. due to a Candid decoding error of the reply)");
+        }
+      );
+    };
     cleanup := b;
     switch result {
       case null {
@@ -359,7 +386,7 @@ func @new_async<T <: Any>() : (@Async<T>, @Cont<T>, @Cont<Error>, @CleanCont) {
     };
   };
 
-  (enqueue, fulfill, fail, func() = cleanup());
+  (enqueue, fulfill, fail, clean);
 };
 
 // Subset of IC management canister interface required for our use

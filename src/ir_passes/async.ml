@@ -48,7 +48,8 @@ let t_async_fut as_seq t =
   Func (Local, Returns, [], [fulfillT as_seq t; failT; bailT],
         [sum [
              ("suspend", unit);
-             ("schedule", Func(Local, Returns, [], [], []))]])
+             ("schedule", Func(Local, Returns, [], [], []));
+             ("trap", Func(Local, Returns, [], [], []))]])
 
 let t_async_cmp as_seq t =
   Func (Local, Returns, [], [fulfillT as_seq t; failT; bailT], [])
@@ -263,7 +264,16 @@ let transform prog =
         | Func(_, _, [], _, []) ->
           (* unit answer type, from await in `async {}` *)
           (ensureNamed (t_exp krb) (fun vkrb ->
-            let schedule = fresh_var "schedule" (Func(Local, Returns, [], [], [])) in
+            let thunkT = Func(Local, Returns, [], [], []) in
+            let schedule = fresh_var "schedule" thunkT in
+            let trap = fresh_var "trap" thunkT in
+            (* try await async (); thunk() catch e -> r(e), with cleanup b *)
+            let resume_later thunk =
+              let v = fresh_var "call" unit in
+              letE v
+                (selfcallE [] (ic_replyE [] (unitE())) (varE thunk) (projE (varE vkrb) 1)
+                   ([] -->* (projE (varE vkrb) 2 -*- unitE ())))
+                (check_call_perform_status (varE v) (fun e -> projE (varE vkrb) 1 -*- e)) in
             switch_variantE (t_exp a -*- varE vkrb)
               [ ("suspend", wildP,
                   unitE()); (* suspend *)
@@ -271,12 +281,11 @@ let transform prog =
                   (if short then (* resume immediately *)
                      varE schedule -*- unitE ()
                    else (* resume later *)
-                     (* try await async (); schedule() catch e -> r(e) *)
-                     let v = fresh_var "call" unit in
-                     letE v
-                       (selfcallE [] (ic_replyE [] (unitE())) (varE schedule) (projE (varE vkrb) 1)
-                          ([] -->* (projE (varE vkrb) 2 -*- unitE ())))
-                       (check_call_perform_status (varE v) (fun e -> projE (varE vkrb) 1 -*- e))))
+                     resume_later schedule));
+                (* the future's callback trapped: always trap in a fresh
+                   callback (even for `await?`), so that the cleanup `b`
+                   of this await runs *)
+                ("trap", varP trap, resume_later trap)
               ]
               unit
           )).it
