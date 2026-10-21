@@ -11610,8 +11610,23 @@ and compile_prim_invocation (env : E.t) ae p es at =
     G.concat_map (compile_exp_vanilla env ae) es
   | ProjPrim n, [e1] ->
     SR.Vanilla,
-    compile_exp_vanilla env ae e1 ^^ (* offset to tuple (an array) *)
-    Tuple.load_n env (Int64.of_int n)
+    (* Try to get the tuple unboxed, to avoid allocating it on the heap *)
+    let arity = match Type.promote e1.note.Note.typ with
+      | Type.Tup ts when List.length ts <> 1 -> List.length ts
+      | _ -> 1 in
+    let tup_hint = if arity = 1 then SR.Vanilla else SR.UnboxedTuple arity in
+    begin match compile_exp_with_hint env ae (Some tup_hint) e1 with
+    | SR.UnboxedTuple k, code1 when k = arity && k <> 1 ->
+      let (set_x, get_x) = new_local env "proj" in
+      code1 ^^
+      G.table (k - 1 - n) (fun _ -> G.i Drop) ^^
+      set_x ^^
+      G.table n (fun _ -> G.i Drop) ^^
+      get_x
+    | sr, code1 ->
+      code1 ^^ StackRep.adjust env sr SR.Vanilla ^^ (* offset to tuple (an array) *)
+      Tuple.load_n env (Int64.of_int n)
+    end
 
   | OptPrim, [e] ->
     SR.Vanilla,
@@ -13007,15 +13022,39 @@ and compile_exp_with_hint (env : E.t) ae sr_hint exp =
     )
 
   | SwitchE (e, cs) ->
-    let code1 = compile_exp_vanilla env ae e in
-    let (set_i, get_i) = new_local env "switch_in" in
+    let cs = simplify_cases e cs in
+    (* A tuple scrutinee that no case binds as a whole is kept in locals,
+       one per component, instead of being allocated *)
+    let by_component (c : case) = match c.it.pat.it with
+      | TupP _ -> true
+      | _ -> Ir_utils.is_irrefutable_nonbinding c.it.pat in
+    let n = match Type.promote e.note.Note.typ with
+      | Type.Tup ts when List.for_all by_component cs -> List.length ts
+      | _ -> 1 in
+    let hint = if n = 1 then SR.Vanilla else SR.UnboxedTuple n in
+    let scrut_code, fill_scrut =
+      match compile_exp_with_hint env ae (Some hint) e with
+      | SR.UnboxedTuple m, code when m = n && n <> 1 ->
+        let locals = Lib.List.table n (fun _ -> new_local env "switch_in") in
+        code ^^ G.concat_map fst (List.rev locals),
+        (fun ae1 (pat : pat) -> match pat.it with
+          | TupP ps ->
+            List.fold_right2 (fun (_, get_i) p code ->
+              CannotFail get_i ^^^ fill_pat env ae1 p ^^^ code
+            ) locals ps (CannotFail G.nop)
+          | _ -> CannotFail G.nop)
+      | sr, code ->
+        let (set_i, get_i) = new_local env "switch_in" in
+        code ^^ StackRep.adjust env sr SR.Vanilla ^^ set_i,
+        (fun ae1 pat -> CannotFail get_i ^^^ fill_pat env ae1 pat) in
 
     (* compile subexpressions and collect the provided stack reps *)
     let codes = List.map (fun {it={pat; exp=e}; _} ->
-      let (ae1, pat_code) = compile_pat_local env ae pat in
+      let ae1 = alloc_pat_local env ae pat in
+      let pat_code = fill_scrut ae1 pat in
       let (sr, rhs_code) = compile_exp_with_hint env ae1 sr_hint e in
-      (sr, CannotFail get_i ^^^ pat_code ^^^ CannotFail rhs_code)
-      ) (simplify_cases e cs) in
+      (sr, pat_code ^^^ CannotFail rhs_code)
+      ) cs in
 
     (* Use the expected stackrep, if given, else infer from the branches *)
     let final_sr = match sr_hint with
@@ -13025,7 +13064,7 @@ and compile_exp_with_hint (env : E.t) ae sr_hint exp =
 
     final_sr,
     (* Run scrut *)
-    code1 ^^ set_i ^^
+    scrut_code ^^
     (* Run rest in block to exit from *)
     MultiVal.block_ env (StackRep.to_block_type env final_sr) (fun branch_code ->
        orsPatternFailure env (List.map (fun (sr, c) ->
