@@ -4,6 +4,10 @@
 
 * motoko (`moc`)
 
+  * bugfix: an `await` or `await?` of a future whose reply callback already
+    trapped now runs the awaiting computation's `finally` clauses instead
+    of suspending forever. This includes Candid decoding failures before
+    a waiter was registered (fixes #5909).
   * Added `Prim.subnetSelfNodeCount() : Nat32` and
     `Prim.costHttpRequestV2(params : Blob) : Nat`, exposing
     `ic0.subnet_self_node_count` and `ic0.cost_http_request_v2` for
