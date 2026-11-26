@@ -11,6 +11,10 @@
     bit-twiddling code (SHA-256, BLAKE2s, ChaCha, CRCs, PRNGs) compiles to
     considerably fewer instructions (#6540).
 
+  * bugfix: `performanceCounter(1)` now reads counter 1, the instructions of
+    the whole call context. The counter type was dropped on the way to the
+    system API, so every counter type read counter 0 (#6540).
+
 ## 2.2.5 (2026-11-24)
 
 * motoko (`moc`)
