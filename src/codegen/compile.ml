@@ -11043,8 +11043,9 @@ let compile_unop env t op =
      SR.UnboxedWord64 p, SR.UnboxedWord64 p,
      compile_xor_const (-1L)
   | NotOp, Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)) ->
-     (* flips the payload bits only, so garbage in the low bits stays garbage *)
-     SR.UnsanitizedWord64 ty, SR.UnsanitizedWord64 ty,
+     (* Flips the payload bits only, so this also works on unsanitized words,
+        see `compile_small_word_bitop` *)
+     StackRep.of_type t, StackRep.of_type t,
      compile_unboxed_const (TaggedSmallWord.mask_of_type ty) ^^
      G.i (Binary (Wasm_exts.Values.I64 I64Op.Xor))
   | _ ->
@@ -11284,24 +11285,34 @@ let compile_smallNat_kernel env ty name op =
 
 (* The stack representations a binary operator expects for both of its operands
    and produces for its result. Usually `StackRep.of_type t` for both, but the
-   bitwise operators on small words get by with, and leave behind, words whose
-   padding bits are garbage (see `SR.UnsanitizedWord64`), so that a chain of them
+   shifts and rotations of small words leave behind words whose padding bits
+   are garbage (see `SR.UnsanitizedWord64`), so that a chain of bit operations
    is sanitized once, by whoever consumes the final result:
-   - and, or, xor: operate bitwise, so garbage in, garbage out, payload intact.
    - right shifts: shift payload bits into the padding, so the result is dirty
-     anyway; garbage in the operand only shifts further down.
+     anyway; garbage in the operand only shifts further down (and the shift
+     amount is taken from the payload alone).
    - rotations: the operand must be clean (it is duplicated into the padding),
      the result is dirty.
    - left shifts: the operand must be clean (padding bits would shift into the
-     payload), and the result is clean. *)
+     payload), and the result is clean.
+   - and, or, xor, not: operate bitwise, so they accept either kind of operand;
+     which kind they produce depends on the operands, and is decided in
+     `compile_small_word_bitop`. *)
 let binop_stackreps t op =
   let sr = StackRep.of_type t in
   Operator.(match t, op with
-  | Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)), (AndOp | OrOp | XorOp | ShROp) ->
+  | Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)), ShROp ->
     SR.UnsanitizedWord64 ty, SR.UnsanitizedWord64 ty
   | Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)), (RotLOp | RotROp) ->
     sr, SR.UnsanitizedWord64 ty
   | _ -> sr, sr)
+
+(* Does a value in this stack representation, once adjusted to `UnboxedWord64 ty`,
+   come with clean padding bits at no cost? (Constants do: the literal is clean.) *)
+let is_sanitized_word ty = function
+  | SR.UnboxedWord64 ty' -> ty = ty'
+  | SR.Const _ -> true
+  | _ -> false
 
 (* The first returned StackRep is for the arguments (expected), the second for the results (produced) *)
 let compile_binop env t op : SR.t * SR.t * G.t =
@@ -11734,6 +11745,35 @@ and compile_prim_invocation (env : E.t) ae p es at =
 
   (* Operators *)
   | UnPrim (_, Operator.PosOp), [e1] -> compile_exp env ae e1
+  (* Bitwise operators on small words: these work on sanitized and unsanitized
+     operands alike (see `SR.UnsanitizedWord64`), so take the operands as they
+     come and let the result be as clean as the operands make it:
+     sanitized if all operands are, or, for `&`, if one of them is (a clean
+     operand clears the padding of the other). Otherwise the operands are used
+     unsanitized, which costs nothing, and the result is unsanitized. *)
+  | UnPrim (Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)) as t, Operator.NotOp), [e1] ->
+    let _, _, code = compile_unop env t Operator.NotOp in
+    let sr1, code1 = compile_exp env ae e1 in
+    let sr = if is_sanitized_word ty sr1 then SR.UnboxedWord64 ty else SR.UnsanitizedWord64 ty in
+    sr,
+    code1 ^^ StackRep.adjust env sr1 sr ^^
+    code
+  | BinPrim (Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)) as t, Operator.(AndOp | OrOp | XorOp as op)), [e1;e2] ->
+    let _, _, code = compile_binop env t op in
+    let sr1, code1 = compile_exp env ae e1 in
+    let sr2, code2 = compile_exp env ae e2 in
+    let clean = SR.UnboxedWord64 ty in
+    let dirty = SR.UnsanitizedWord64 ty in
+    let sr_in1, sr_in2, sr_out =
+      match op, is_sanitized_word ty sr1, is_sanitized_word ty sr2 with
+      | _, true, true -> clean, clean, clean
+      | Operator.AndOp, true, false -> clean, dirty, clean
+      | Operator.AndOp, false, true -> dirty, clean, clean
+      | _ -> dirty, dirty, dirty in
+    sr_out,
+    code1 ^^ StackRep.adjust env sr1 sr_in1 ^^
+    code2 ^^ StackRep.adjust env sr2 sr_in2 ^^
+    code
   | UnPrim (t, op), [e1] ->
     let sr_in, sr_out, code = compile_unop env t op in
     sr_out,
