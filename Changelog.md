@@ -1,5 +1,16 @@
 # Motoko compiler changelog
 
+## Next
+
+* motoko (`moc`)
+
+  * Chains of bitwise operations on `Nat8`, `Nat16`, `Nat32` and their `Int`
+    counterparts (`&`, `|`, `^`, `^` prefix, `>>`, `<<>`, `<>>`) now restore
+    the word representation once, where the result is consumed, instead of
+    after every right shift and rotation. SHA-style mixing such as
+    `(e <>> 6) ^ (e <>> 11) ^ (e <>> 25)` compiles to fewer instructions
+    (#6540).
+
 ## 2.2.5 (2026-11-24)
 
 * motoko (`moc`)
