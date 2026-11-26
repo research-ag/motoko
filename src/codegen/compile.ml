@@ -326,6 +326,14 @@ module SR = struct
     | Vanilla
     | UnboxedTuple of int
     | UnboxedWord64 of Type.prim
+    (* Like `UnboxedWord64` for the small words {Int,Nat}{8,16,32}, i.e. the
+       payload sits in the high bits of the i64, but the low (padding) bits are
+       not known to be clear: they may hold leftovers of a right shift or a
+       rotation. Bitwise operations (and, or, xor, not) and right shifts
+       tolerate such operands and produce such results, so a chain of them is
+       sanitized only once, when a consumer needs the invariant restored
+       (arithmetic, comparison, tagging as Vanilla). See module TaggedSmallWord. *)
+    | UnsanitizedWord64 of Type.prim
     | UnboxedFloat64
     | UnboxedFloat32
     | Unreachable
@@ -346,6 +354,7 @@ module SR = struct
   let to_var_type : t -> value_type = function
     | Vanilla -> I64Type
     | UnboxedWord64 _ -> I64Type
+    | UnsanitizedWord64 _ -> I64Type
     | UnboxedFloat64 -> F64Type
     | UnboxedFloat32 -> F32Type
     | UnboxedTuple n -> fatal "to_var_type: UnboxedTuple"
@@ -2778,15 +2787,17 @@ module TaggedSmallWord = struct
         E.else_trap_with env "negative power" ^^
         get_n ^^ get_exp ^^ compile_nat_power env (toNat ty))
 
-  (* To rotate, first rotate a copy by bits_of_type into the other direction *)
+  (* To rotate, first rotate a copy by bits_of_type into the other direction.
+     The word `n` must be sanitized (the copy would spread garbage otherwise);
+     the result is not: the bits rotated out of the payload remain in the
+     low bits, see `SR.UnsanitizedWord64`. *)
   let rotl env ty =
      Func.share_code2 Func.Never env (prim_fun_name ty "rotl") (("n", I64Type), ("by", I64Type)) [I64Type]
        (fun env get_n get_by ->
         let open Wasm_exts.Values in
         let beside_adjust = compile_rotr_const (Int64.of_int (bits_of_type ty)) in
         get_n ^^ get_n ^^ beside_adjust ^^ G.i (Binary (I64 I64Op.Or)) ^^
-        get_by ^^ lsb_adjust ty ^^ clamp_shift_amount ty ^^ G.i (Binary (I64 I64Op.Rotl)) ^^
-        sanitize_word_result ty
+        get_by ^^ lsb_adjust ty ^^ clamp_shift_amount ty ^^ G.i (Binary (I64 I64Op.Rotl))
        )
 
   let rotr env ty =
@@ -2795,8 +2806,7 @@ module TaggedSmallWord = struct
         let open Wasm_exts.Values in
         let beside_adjust = compile_rotl_const (Int64.of_int (bits_of_type ty)) in
         get_n ^^ get_n ^^ beside_adjust ^^ G.i (Binary (I64 I64Op.Or)) ^^
-        get_by ^^ lsb_adjust ty ^^ clamp_shift_amount ty ^^ G.i (Binary (I64 I64Op.Rotr)) ^^
-        sanitize_word_result ty
+        get_by ^^ lsb_adjust ty ^^ clamp_shift_amount ty ^^ G.i (Binary (I64 I64Op.Rotr))
        )
 
   let tag env pty =
@@ -6482,6 +6492,7 @@ module StackRep = struct
   let to_block_type env = function
     | Vanilla -> [I64Type]
     | UnboxedWord64 _ -> [I64Type]
+    | UnsanitizedWord64 _ -> [I64Type]
     | UnboxedFloat64 -> [F64Type]
     | UnboxedFloat32 -> [F32Type]
     | UnboxedTuple n -> Lib.List.make n I64Type
@@ -6491,6 +6502,7 @@ module StackRep = struct
   let to_string = function
     | Vanilla -> "Vanilla"
     | UnboxedWord64 pty -> prim_fun_name pty "UnboxedWord64"
+    | UnsanitizedWord64 pty -> prim_fun_name pty "UnsanitizedWord64"
     | UnboxedFloat64 -> "UnboxedFloat64"
     | UnboxedFloat32 -> "UnboxedFloat32"
     | UnboxedTuple n -> Printf.sprintf "UnboxedTuple %d" n
@@ -6509,6 +6521,10 @@ module StackRep = struct
     | _, Vanilla -> Vanilla
     | Vanilla, _ -> Vanilla
 
+    (* A sanitized word is also a valid unsanitized one *)
+    | UnboxedWord64 p1, UnsanitizedWord64 p2 when p1 = p2 -> sr2
+    | UnsanitizedWord64 p1, UnboxedWord64 p2 when p1 = p2 -> sr1
+
     | UnboxedTuple n, UnboxedTuple m when n = m -> sr1
 
     | _, _ ->
@@ -6519,7 +6535,7 @@ module StackRep = struct
 
   let drop env (sr_in : t) =
     match sr_in with
-    | Vanilla | UnboxedWord64 _ | UnboxedFloat64 | UnboxedFloat32 -> G.i Drop
+    | Vanilla | UnboxedWord64 _ | UnsanitizedWord64 _ | UnboxedFloat64 | UnboxedFloat32 -> G.i Drop
     | UnboxedTuple n -> G.table n (fun _ -> G.i Drop)
     | Const _ | Unreachable -> G.nop
 
@@ -6584,6 +6600,19 @@ module StackRep = struct
     | Vanilla, UnboxedWord64 Type.(Nat8 | Int8 | Nat16 | Int16 | Int32 | Nat32 | Char as pty) ->
       TaggedSmallWord.untag env pty
 
+    (* Unsanitized small words: the low bits are don't-care, so sanitizing is
+       only needed when leaving this representation, and never when entering it *)
+    | UnsanitizedWord64 pty1, UnboxedWord64 pty2 when pty1 = pty2 ->
+      TaggedSmallWord.sanitize_word_result pty1
+    | UnboxedWord64 pty1, UnsanitizedWord64 pty2 when pty1 = pty2 ->
+      G.nop
+    | UnsanitizedWord64 pty, Vanilla ->
+      TaggedSmallWord.sanitize_word_result pty ^^
+      TaggedSmallWord.tag env pty
+    | Vanilla, UnsanitizedWord64 pty ->
+      (* the tag bits are allowed to stay, no need to clear them *)
+      BitTagged.sanity_check_tag __LINE__ env pty
+
     | UnboxedFloat64, Vanilla -> Float.box env
     | Vanilla, UnboxedFloat64 -> Float.unbox env
 
@@ -6602,6 +6631,8 @@ module StackRep = struct
     | Const Const.Lit (Const.Vanilla n), UnboxedWord64 ty ->
         compile_unboxed_const n ^^
         TaggedSmallWord.untag env ty
+    | Const Const.Lit (Const.Vanilla n), UnsanitizedWord64 ty ->
+        compile_unboxed_const n
     | Const Const.Lit (Const.Word64 (ty1, n)), UnboxedWord64 ty2 when ty1 = ty2 ->
         compile_unboxed_const n
     | Const Const.Lit (Const.Float64 f), UnboxedFloat64 -> Float.compile_unboxed_const f
@@ -11012,7 +11043,8 @@ let compile_unop env t op =
      SR.UnboxedWord64 p, SR.UnboxedWord64 p,
      compile_xor_const (-1L)
   | NotOp, Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)) ->
-     StackRep.of_type t, StackRep.of_type t,
+     (* flips the payload bits only, so garbage in the low bits stays garbage *)
+     SR.UnsanitizedWord64 ty, SR.UnsanitizedWord64 ty,
      compile_unboxed_const (TaggedSmallWord.mask_of_type ty) ^^
      G.i (Binary (Wasm_exts.Values.I64 I64Op.Xor))
   | _ ->
@@ -11250,11 +11282,33 @@ let compile_smallNat_kernel' env ty name op =
 let compile_smallNat_kernel env ty name op =
   compile_smallNat_kernel' env ty name (G.i (Binary (Wasm_exts.Values.I64 op)))
 
+(* The stack representations a binary operator expects for both of its operands
+   and produces for its result. Usually `StackRep.of_type t` for both, but the
+   bitwise operators on small words get by with, and leave behind, words whose
+   padding bits are garbage (see `SR.UnsanitizedWord64`), so that a chain of them
+   is sanitized once, by whoever consumes the final result:
+   - and, or, xor: operate bitwise, so garbage in, garbage out, payload intact.
+   - right shifts: shift payload bits into the padding, so the result is dirty
+     anyway; garbage in the operand only shifts further down.
+   - rotations: the operand must be clean (it is duplicated into the padding),
+     the result is dirty.
+   - left shifts: the operand must be clean (padding bits would shift into the
+     payload), and the result is clean. *)
+let binop_stackreps t op =
+  let sr = StackRep.of_type t in
+  Operator.(match t, op with
+  | Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)), (AndOp | OrOp | XorOp | ShROp) ->
+    SR.UnsanitizedWord64 ty, SR.UnsanitizedWord64 ty
+  | Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)), (RotLOp | RotROp) ->
+    sr, SR.UnsanitizedWord64 ty
+  | _ -> sr, sr)
+
 (* The first returned StackRep is for the arguments (expected), the second for the results (produced) *)
 let compile_binop env t op : SR.t * SR.t * G.t =
   if t = Type.Non then SR.Vanilla, SR.Unreachable, G.i Unreachable else
-  StackRep.of_type t,
-  StackRep.of_type t,
+  let sr_in, sr_out = binop_stackreps t op in
+  sr_in,
+  sr_out,
   Operator.(match t, op with
   | Type.(Prim (Nat | Int)),                  AddOp -> BigNum.compile_add env
   | Type.(Prim (Nat64|Int64)),                WAddOp -> G.i (Binary (Wasm_exts.Values.I64 I64Op.Add))
@@ -11475,15 +11529,15 @@ let compile_binop env t op : SR.t * SR.t * G.t =
      lsb_adjust ty ^^ clamp_shift_amount ty ^^
      G.i (Binary (Wasm_exts.Values.I64 I64Op.Shl)))
   | Type.(Prim Nat64),                        ShROp -> G.i (Binary (Wasm_exts.Values.I64 I64Op.ShrU))
+  (* The small-word right shifts leave the bits shifted out of the payload in
+     the padding; the result is `SR.UnsanitizedWord64`, see `binop_stackreps` *)
   | Type.(Prim (Nat8|Nat16|Nat32 as ty)),     ShROp -> TaggedSmallWord.(
      lsb_adjust ty ^^ clamp_shift_amount ty ^^
-     G.i (Binary (Wasm_exts.Values.I64 I64Op.ShrU)) ^^
-     sanitize_word_result ty)
+     G.i (Binary (Wasm_exts.Values.I64 I64Op.ShrU)))
   | Type.(Prim Int64),                        ShROp -> G.i (Binary (Wasm_exts.Values.I64 I64Op.ShrS))
   | Type.(Prim (Int8|Int16|Int32 as ty)),     ShROp -> TaggedSmallWord.(
      lsb_adjust ty ^^ clamp_shift_amount ty ^^
-     G.i (Binary (Wasm_exts.Values.I64 I64Op.ShrS)) ^^
-     sanitize_word_result ty)
+     G.i (Binary (Wasm_exts.Values.I64 I64Op.ShrS)))
   | Type.(Prim (Nat64|Int64)),                RotLOp -> G.i (Binary (Wasm_exts.Values.I64 I64Op.Rotl))
   | Type.(Prim (Nat8|Nat16|Nat32|Int8|Int16|Int32 as ty)),
                                               RotLOp -> TaggedSmallWord.rotl env ty
